@@ -1,7 +1,7 @@
 # update_aws
 The update_aws file provides a nice GUI command tool for working with AWS Cloudformation stacks.  It requires that aws_manager be installed (credit to Cake Solutions for the aws_manager). It is a WIP and still heavily tailored for my own personal use.  I will get around to generalizing it once I find the time. Lastly, yes...there are many other languages better suited for this sort of GUI, but hey..I like bash. :)
 
-
+# aws_manager
 `aws_manager` is a toolkit (Ruby gem for the CLI) for interacting with AWS resources using the Ruby AWS SDK.
 
 ## Installation
