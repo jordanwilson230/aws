@@ -1,0 +1,651 @@
+#!/bin/bash
+
+autopilot=$1
+clear; echo -e "\n \nThis is a proof of concept script :)
+Please report any bugs to Jordan. 
+\n\n  Press Any ENTER to Continue."
+read key
+
+test -d /System && system='apple' || system='linux'
+if [[ "$system" == "apple" ]]; then
+	pgrep -i 'chrome' 1> /dev/null 2> /dev/null && browser='Google Chrome'
+	pgrep 'firefox' 1> /dev/null 2> /dev/null && browser='Firefox'
+	if ! which dialog > /dev/null; then
+	        echo '[dialog]' must be installed in order to run this script.  Install now [ y/n ]?
+	        read answer
+	        [[ "$answer" == "y" ]] && brew install dialog || echo 'Exiting.' && exit 1
+	fi
+else
+        if ! which dialog > /dev/null; then
+		echo; echo 'This script depends on the "dialog" script.  Please install and retry.'
+		exit 1
+	fi
+fi
+
+export TZ=UTC
+time_now=$(date +%s)
+newline=$'\n'
+[[ "$autopilot" == "force" ]] && force='--force-update' || force=''
+cursor='/'
+CSP_GLOBAL=( $(dig -t TXT +short __regions-production.hub.bitbrew.com | tr -d '"') )
+#export CSP_GLOBAL="us-east-1 us-west-2 eu-west-1"
+templates=( "cloud_formation/bitbrew_hub_secgroups_master_tier.json" "cloud_formation/bitbrew_hub_secgroups_slave_tier.json" "cloud_formation/bitbrew_hub_secgroups_support_tier.json" )
+# Check if we're in the right directory
+dir=$(basename $(pwd))
+[[ "$dir" != "danlaw-provisioning" ]] && echo "Must be run from the 'danlaw-provisioning' root directory. Exiting." && exit 1
+
+############################################################### Define Functions
+function reload_browser() {
+o=1
+osascript <<EOD
+tell application "$browser"
+  activate
+  tell application "System Events"
+    tell process "$browser"
+      keystroke "r" using {command down, shift down}
+    end tell
+  end tell
+end tell
+EOD
+}
+#tell application "iTerm" to activate
+
+function wait_for_complete() {
+	sleep 1
+        CREATE=''
+	EVENTS=$(aws cloudformation describe-stack-events --region ${CSP_REGION} --stack-name ${STACK_NAME} --max-items 10 --output table --query 'StackEvents[].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' 2> /dev/null | sed -e 's/\.[0-9][0-9][0-9]Z//g; s/\(.[0-9]\)T/\1 /g;  s/^\(.\{175\}\)\(.*\)/\1|/g; s/-|/--/g')
+#       EVENTS=$(aws cloudformation describe-stack-events --stack-name ${STACK_NAME} --max-items 3 --output table --query 'StackEvents[].[Timestamp,StackName,ResourceType,ResourceStatus]' 2> /dev/null)
+        stack_status=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME} 2> /dev/null | jq  -r '.Stacks[].StackStatus' 2> /dev/null)
+        [ $? -ne 0 ] && CREATE='true'
+	time_modified=$(aws cloudformation describe-stack-events --stack-name ${STACK_NAME} | jq -r '.StackEvents[0].Timestamp' | xargs date -j -f "%Y-%m-%dT%H:%M:%S" +%s 2>/dev/null)
+	time_updated=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME}  | jq  -r '.Stacks[0].LastUpdatedTime' | xargs date -j -f "%Y-%m-%dT%H:%M:%S" +%s 2>/dev/null)
+	time_created=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME}  | jq  -r '.Stacks[0].CreationTime' | xargs date -j -f "%Y-%m-%dT%H:%M:%S" +%s 2>/dev/null)
+
+        case "$command" in
+                *"must match generated stack name"*|*"does not exist"*)
+                        dialog --no-collapse --title "Create Stack?" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" 'ERROR' --and-widget --yesno "No Stack was found with the name ${STACK_NAME}. Create a new one?" 30 180
+                        if [ $? -eq 0 ]; then
+                                CREATE='true' && ${STACK}
+			elif [ $? -eq 1 ]; then
+				return 0
+                        else
+                                exit 1
+                        fi
+                ;;
+                *"Found parameters diffs"*|*"Found templates diffs"*)
+                        dialog --no-collapse --title "Changes Found" --mixedgauge "" 47 190 $progress "[${counter}/${#STACKS[@]}] ${STACK_NAME}" 'Changes Were Found' --and-widget --yesno "Warning: To continue, you must force the update for ${STACK_NAME}. Would you like to view the changes?" 15 60  2>&1
+                        if [ $? -eq 0 ]; then
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Template Change" --yesno "$command" 80 220 2> /dev/null
+				if [ $? -eq 0 ]; then force='--force-update' && "${STACK}" ; elif [ $? -eq 255 ]; then exit 1 ; else return 1 ; fi
+                        elif [ $? -eq 1 ]; then
+				return 0
+			else 
+				exit 1
+			fi
+                ;;
+                *"No updates are to be performed"*)
+                        dialog --no-collapse --title "No Changes Found" --mixedgauge "" 47 190 $progress "[${counter}/${#STACKS[@]}] ${STACK_NAME}" 'No changes Were Found' --and-widget --msgbox "${command}" 20 75
+                        [ $? -eq 0 ] && return 0 || exit 1
+                ;;
+                *"Error"*|*"no default values"*)
+                        dialog --no-collapse --title "Error Updating ${STACK_NAME}" --mixedgauge "" 47 190 ${progress} ${stack_status[@]:0:20} --and-widget --msgbox "An error was encountered while tring to update ${STACK_NAME}! ${newline} ${command}" 40 130
+                        sleep 3
+                        exit 1
+                ;;
+                *)
+                        error=$(cat "$command" | grep -i 'error\|failed\|failure\|cancel\|abort')
+                        if [[ ! -z "$error" ]]; then
+                                dialog --no-collapse --title "Stacks Modified" --mixedgauge "" 47 190 ${progress} ${stack_status[@]:0:20} --and-widget --infobox "An error was encountered while tring to update ${STACK_NAME}! ${newline} URL: https://console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active ${newline} ${newline} ${command}" 40 130
+				exit 1
+			else
+			        count=0
+			        until [ $time_now -lt $time_modified ]; do
+			                let count=count+1
+			                dialog --no-collapse --title "[${STACK_NAME}] ${CSP_ENVIRONMENT} ${CSP_REGION}" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "Waiting...${cursor}" --and-widget --infobox "${newline} ${newline} ${EVENTS}" 30 180 2>&1
+			                time_modified=$(aws cloudformation describe-stack-events --stack-name ${STACK_NAME} | jq -r '.StackEvents[0].Timestamp' 2> /dev/null)
+			                if [ $count -gt 10 ]; then
+			                        dialog --no-collapse --title "Stacks Modified" --mixedgauge "" 47 190 ${progress} ${stack_status[@]:0:20} --and-widget --msgbox "An error was encountered while tring to update ${STACK_NAME}! ${newline} URL: https://console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active ${newline} ${newline} ${command}" 40 130
+			                        exit 1
+			                fi
+			                sleep 2
+			                reload_browser
+			        done
+                        fi
+                ;;
+        esac
+
+        dialog --no-collapse --title "[${STACK_NAME}] ${CSP_ENVIRONMENT} ${CSP_REGION}" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "Updating" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2>&1
+	for i in {1..500} ; do
+		if [ $i -eq 1 ] && [[ "$system" == "apple" ]] && [[ "$reload" == "true" ]]; then
+			reload=''
+			stack_id=$(aws cloudformation describe-stack-events --region ${CSP_REGION} --stack-name ${STACK_NAME} --max-items 1 | jq -r '.StackEvents[].StackId')
+			open "https://${CSP_REGION}.console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active&tab=events&stackId=${stack_id}"
+		fi
+		[ $((i%2)) -eq 0 ] && reload_browser
+		EVENTS=$(aws cloudformation describe-stack-events --region ${CSP_REGION} --stack-name ${STACK_NAME} --max-items 10 --output table --query 'StackEvents[].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' 2> /dev/null | sed -e 's/\.[0-9][0-9][0-9]Z//g; s/\(.[0-9]\)T/\1 /g;  s/^\(.\{175\}\)\(.*\)/\1|/g; s/-|/--/g')
+		stack_status=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME} 2> /dev/null  | jq  -r '.Stacks[].StackStatus' 2> /dev/null)
+		case "$stack_status" in
+			"CREATE_IN_PROGRESS")
+		                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Update in Progress" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+			;;
+			"DELETE_IN_PROGRESS")
+		                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Update in Progress" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+			;;
+			"ROLLBACK_IN_PROGRESS")
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Rolling Back" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+			;;
+			"UPDATE_COMPLETE_CLEANUP_IN_PROGRESS")
+		                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Update in Progress" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+			;;
+			"UPDATE_IN_PROGRESS")
+		                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Update in Progress" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+			;;
+			"UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS")
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Rolling Back" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+			;;
+                        "UPDATE_ROLLBACK_FAILED")
+				dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Unable to Rollback" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Stack status is: ${stack_status} ${newline} URL: https://console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active ${newline} ${newline} ${command}" 30 180 2> /dev/null
+                                exit 1
+				stack_results=( "${STACKS[@]/*${STACK}*/${STACK} FAILED}" )
+			;;
+			"UPDATE_ROLLBACK_IN_PROGRESS")
+				dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Rollback Complete" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Stack status is: ${stack_status} ${newline} ${newline} ${command}" 30 180 2> /dev/null
+			;;
+			"CREATE_FAILED")
+				dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Unable to Create" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+				sleep 1
+                                exit 1
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} FAILED}" )
+			;;
+			"DELETE_FAILED")
+				dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Unable to Delete" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Stack status is: ${stack_status} ${newline} URL: https://console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active ${newline} ${newline} ${command}" 30 180 2> /dev/null
+				sleep 1
+				exit 1
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} FAILED}" )
+			;;
+			"ROLLBACK_FAILED")
+				dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Unable to Rollback" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Stack status is: ${stack_status[@]} ${newline} URL: https://console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active ${newline} ${newline} ${command}" 30 180 2> /dev/null
+				sleep 1
+				exit 1
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} FAILED}" )
+			;;
+                        "CREATE_COMPLETE")
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Create Complete" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+				sleep 1
+				return 0
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} CREATED}" )
+			;;
+			"UPDATE_COMPLETE")
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Update Complete" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+                                sleep 1
+                                return 0
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} UPDATED}" )
+			;;
+			"UPDATE_ROLLBACK_COMPLETE")
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Rollback Complete" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+                                sleep 1
+                                return 0
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} FAILED}" )
+			;;
+                        "ROLLBACK_COMPLETE")
+                                dialog --no-collapse --title "${STACK_NAME} ${CSP_ENVIRONMENT}-${CSP_REGION}: Rollback Complete" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "Output: [${cursor}] ${newline} ${newline} ${EVENTS}" 30 180 2> /dev/null
+                                sleep 1
+                                return 0
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} FAILED}" )
+			;;
+			*)
+				dialog --no-collapse --title "[${STACK_NAME}] ${CSP_ENVIRONMENT} ${CSP_REGION}" --mixedgauge "" 47 190 ${progress} "[${counter}/${#STACKS[@]}] ${STACK_NAME}" "${stack_status[@]:0:20}" --and-widget --infobox "ERROR: Unable to retrieve status for ${STACK_NAME}: ${command}" 20 75 2>&1
+                                stack_results=( "${STACKS[@]/*${STACK}*/${STACK} ERROR}" )
+				return 0
+			;;
+		esac
+
+		[ $progress -lt 97 ] && let progress=progress+1
+#                time_updated=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME}  | jq  -r '.Stacks[] | .LastUpdatedTimeTime' | date -u "+%s" 2> /dev/null)
+#                time_created=$(aws cloudformation describe-stacks --stack-name ${STACK_NAME}  | jq  -r '.Stacks[] | .CreationTime' | date -u "+%s" 2> /dev/null)
+                if [[ "$cursor" == '/' ]]; then cursor='--'; elif [[ "$cursor" == '--' ]]; then cursor='|'; elif [[ "$cursor" == '|' ]]; then cursor='/'; elif [[ "$cursor" == '/' ]]; then cursor='--'; elif [[ "$cursor" == '\' ]]; then cursor='--'; fi
+		sleep 2
+		[[ "$autopilot" == "force" ]] && force='--force-update' || force=''
+	done
+	unset command
+	CREATE=''
+}
+
+
+
+function SecGroups() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-secgroups-root"
+   # Upload child templates
+	for template in ${TEMPLATES[@]}; do
+	    if [[ -f ${template} ]]; then
+	        command=$(aws_manager s3-upload -f ${template} -b management-hub-${CSP_REGION}-s3-templates -r ${CSP_REGION} 2>&1)
+		wait_for_complete
+	    fi
+	done
+   # Update root template
+	    if [[ "$CREATE" == 'true' ]]; then
+		command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_secgroups_root.json 2>&1)
+                wait_for_complete
+	    else
+	    	command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_secgroups_root.json --stack-name ${STACK_NAME} ${force} 2>&1)
+                wait_for_complete
+	    fi
+	    aws_manager capture-stack-outputs --aws-region ${CSP_REGION} --stack-name ${STACK_NAME} --yaml-file-path inventory/${CSP_ENVIRONMENT}-${CSP_REGION}-hub.yaml  1> /dev/null
+}
+
+function IAM() {
+   # Update Regional IAM Roles
+        STACK_NAME="management-bitbrew-hub-iam-roles"
+	if [[ "$CREATE" == 'true' ]]; then
+            command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/management-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_iam_roles.json  2>&1)
+	else
+	    command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/management-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_iam_roles.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+        fi
+	wait_for_complete
+
+   # Capture regional IAM roles
+        for region in ${CSP_GLOBAL}; do
+	    aws_manager capture-stack-outputs --aws-region ${region} --stack-name ${STACK_NAME} --yaml-file-path inventory/${CSP_ENVIRONMENT}-${region}-hub.yaml  1> /dev/null
+	done
+
+   # Update global IAM roles and policies
+	STACK_NAME='global-bitbrew-hub-iam-roles'
+	if [[ "$CREATE" == 'true' ]]; then
+		command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/global-scope.yaml --cfn-template cloud_formation/bitbrew_hub_iam_roles.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/global-scope.yaml --cfn-template cloud_formation/bitbrew_hub_iam_roles.json  --stack-name ${STACK_NAME} ${force} 2>&1)
+	fi
+	wait_for_complete
+
+	STACK_NAME='global-bitbrew-hub-iam-policies'
+	if [[ "$CREATE" == 'true' ]]; then
+		command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/global-scope.yaml --cfn-template cloud_formation/bitbrew_hub_iam_policies.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/global-scope.yaml --cfn-template cloud_formation/bitbrew_hub_iam_policies.json  --stack-name ${STACK_NAME} ${force} 2>&1)
+	fi
+	wait_for_complete
+
+   # Capture global roles
+	aws_manager capture-stack-outputs --stack-name global-bitbrew-hub-iam-roles --yaml-file-path inventory/common.yaml --aws-region ${CSP_REGION} 1> /dev/null
+
+   # Capture global policies
+	aws_manager capture-stack-outputs --stack-name global-bitbrew-hub-iam-policies --yaml-file-path inventory/common.yaml --aws-region ${CSP_REGION} 1> /dev/null
+}
+
+
+function VPC() {
+	STACK_NAME="${ENVIRONMENT}-bitbrew-hub-vpc-network"
+	if [[ "$CREATE" == 'true' ]]; then
+            command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_vpc_network.json  2>&1)
+	    wait_for_complete
+	else
+	    command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_vpc_network.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	    wait_for_complete
+	fi
+	    aws_manager capture-stack-outputs --aws-region ${CSP_REGION} --stack-name ${STACK_NAME} --yaml-file-path inventory/${CSP_ENVIRONMENT}-${CSP_REGION}-hub.yaml  ${force}  1> /dev/null
+}
+
+function VPN() {
+	STACK_NAME="${ENVIRONMENT}-bitbrew-hub-hardware-vpn"
+	if [[ "$CREATE" == 'true' ]]; then
+		command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_hardware_vpn.json  2>&1)
+		wait_for_complete
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_hardware_vpn.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	        wait_for_complete
+	fi
+}
+
+function Strongswan() {
+	STACK_NAME="${ENVIRONMENT}-bitbrew-hub-strongswan-vpn"
+	if [[ "$CREATE" == 'true' ]]; then
+            command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_strongswan_vpn.json  2>&1)
+	    wait_for_complete
+	else
+	    command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_strongswan_vpn.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	    wait_for_complete
+	fi
+}
+
+function Docker() {
+	STACK_NAME="${ENVIRONMENT}-bitbrew-hub-docker-registry"
+	if [[ "$CREATE" == 'true' ]]; then
+		command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_docker_registry.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_docker_registry.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+        wait_for_complete
+}
+
+function Sensu() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-sensu"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_sensu.json  2>&1)
+		wait_for_complete
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_sensu.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	        wait_for_complete
+	fi
+}
+
+function Zookeeper() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-zookeepers"
+	if [[ "$CREATE" == 'true' ]]; then
+        	command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_zookeepers.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_zookeepers.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+        wait_for_complete
+}
+
+function MesosMaster() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-masters"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_masters.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_masters.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function MesosDNS() {
+		STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-dns"
+		if [[ "$CREATE" == 'true' ]]; then
+		        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_dns.json  2>&1)
+			wait_for_complete
+		else
+			command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_dns.json --stack-name ${CSP_ENVIRONMENT}-bitbrew-hub-mesos-dns  ${force} 2>&1)
+			wait_for_complete
+		fi
+}
+
+function CassandraRegional() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-cassandra"
+	if [[ "$CREATE" == 'true' ]]; then
+        	command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_cassandra.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_cassandra.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function CassandraGlobal() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-cassandra-global"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_cassandra_global.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_cassandra_global.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function CSP() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-csp"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_csp.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_csp.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function Graphite() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-grafana"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_grafana.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_grafana.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function Kafka() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-kafka"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_kafka.json 2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_kafka.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function LoadBalancer() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-pen-lb"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_pen_lb.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_pen_lb.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+	fi
+	wait_for_complete
+}
+
+function RabbitMQ() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-mesos-slaves-rabbitmq"
+	if [[ "$CREATE" == 'true' ]]; then
+	        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_rabbitmq.json  2>&1)
+	else
+		command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_mesos_slaves_rabbitmq.json --stack-name ${STACK_NAME}  2>&1)
+	fi
+	wait_for_complete
+}
+
+function Graylog() {
+	STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-graylog"
+		if [[ "$CREATE" == 'true' ]]; then
+			command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_graylog.json  2>&1)
+			wait_for_complete
+		else
+			command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_graylog.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+			wait_for_complete
+		fi
+}
+
+function FreeIPA() {
+        STACK_NAME="${CSP_ENVIRONMENT}-bitbrew-hub-freeipa"
+                if [[ "$CREATE" == 'true' ]]; then
+                        command=$(aws_manager cf-create-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_freeipa.json  2>&1)
+                        wait_for_complete
+                else
+                        command=$(aws_manager cf-update-stack --hiera-conf=hiera.yaml --aws-region ${CSP_REGION} --scope scopes/${CSP_ENVIRONMENT}-${CSP_REGION}-scope.yaml --cfn-template cloud_formation/bitbrew_hub_freeipa.json --stack-name ${STACK_NAME}  ${force} 2>&1)
+                        wait_for_complete
+                fi
+}
+
+function escape() {
+	if [ "$retval" -eq 255 ]; then
+		rm -rf /tmp/status
+		echo "Exiting."
+		exit 1
+	elif [ "$retval" -eq 1 ]; then
+                rm -rf /tmp/status
+		echo "Canceled."
+		exit 1
+	fi
+	unset retval
+}
+
+function management_warning() {
+        HEIGHT=15
+        WIDTH=40
+        CHOICE_HEIGHT=4
+        BACKTITLE="Warning!"
+        TEXT='The management environment is essential for deploying containers to production and should therefore be treated like a prod environment - PROCEED WITH CAUTION - YOU HAVE BEEN WARNED'
+        TITLE="WARNING!"
+
+        dialog --no-collapse --backtitle "$BACKTITLE" \
+               --title "$TITLE" \
+               --msgbox "${TEXT}"                $HEIGHT $WIDTH \
+                2>&1 >/dev/tty
+
+retval=$?
+escape
+
+clear
+
+}
+
+
+##################################################################### MENU: Question 1
+HEIGHT=15
+WIDTH=40
+CHOICE_HEIGHT=4
+BACKTITLE="Region"
+TITLE="Update AWS"
+MENU="Choose the AWS Region to Update"
+
+OPTIONS=(1 "us-east-1"
+         2 "us-west-2"
+         3 "eu-west-1")
+
+REGION=$(dialog --no-collapse --clear \
+                --backtitle "$BACKTITLE" \
+                --title "$TITLE" \
+                --menu "$MENU" \
+                $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                "${OPTIONS[@]}" \
+                2>&1 >/dev/tty)
+retval=$?
+escape
+clear
+
+case $REGION in
+        1)
+            CSP_REGION="us-east-1"
+            ;;
+        2)
+            CSP_REGION="us-west-2"
+            ;;
+        3)
+	    CSP_REGION="eu-west-1"
+            ;;
+esac
+
+
+################################################################# Menu: Question 2
+BACKTITLE="Environment"
+TITLE="Update AWS"
+MENU="Select the Environment"
+
+OPTIONS=(1 "Sandbox"
+         2 "Staging"
+         3 "Production"
+	 4 'Management')
+
+ENVIRONMENT=$(dialog --no-collapse --clear \
+                --backtitle "$BACKTITLE" \
+                --title "$TITLE" \
+                --menu "$MENU" \
+                $HEIGHT $WIDTH $CHOICE_HEIGHT \
+                "${OPTIONS[@]}" \
+                2>&1 >/dev/tty)
+
+retval=$?
+escape
+
+clear
+
+case $ENVIRONMENT in
+        1)
+            ENVIRONMENT="sandbox"
+            ;;
+        2)
+            ENVIRONMENT="staging"
+            ;;
+        3)
+            ENVIRONMENT="production"
+            ;;
+	4)
+            ENVIRONMENT="management"
+	    management_warning
+	    ;;
+esac
+
+export CSP_ENVIRONMENT=${ENVIRONMENT}
+
+
+################################################################# Menu: Question 3
+
+BACKTITLE="Stack List"
+TITLE="Select Stacks to Update"
+HEIGHT=38
+WIDTH=61
+tempfile=`tempfile 2>/dev/null` || tempfile=/tmp/test$$
+trap "rm -f $tempfile" 0 1 2 5 15
+
+OPTIONS=("SecGroups" "SecGroups includes S3 Upload" ON \
+        "IAM" "Regional IAM Roles" off \
+        "VPC" "VPC & NETWORKING" off \
+        "VPN" "Hardware VPNs" off \
+        "Strongswan" "Strongswans" off \
+        "Docker" "Docker-Registry" off \
+        "Sensu" "Sensu" off)
+
+
+dialog --no-collapse  --backtitle "Stack Selection" \
+       	--title "Select Stacks" --clear \
+        --checklist "Select the Stacks to Update" 44 61 18 \
+        "IAM" "Regional IAM Roles" ON \
+        "VPC" "VPC & NETWORKING" off \
+        "SecGroups" "SecGroups includes S3 Upload" off \
+        "VPN" "Hardware VPNs" off \
+        "Zookeeper" "Zookeeper" off \
+        "MesosMaster" "Mesos Master" off \
+        "MesosDNS" "Mesos DNS" off \
+        "CassandraRegional" "Regional Slaves" off \
+        "CassandraGlobal" "Global Slaves" off \
+        "CSP" "CSP Slaves" off \
+        "Graphite" "Graphite" off \
+        "Kafka" "Kafka" off \
+        "LoadBalancer" "Load Balancer" off \
+        "RabbitMQ" "RabbitMQ Slaves" off \
+        "Graylog" "Graylog" off \
+        "Sensu" "Sensu" off \
+	"FreeIPA" "FreeIPA" off \
+        "Docker" "Docker-Registry" off   2> "$tempfile"
+retval=$?
+escape
+
+
+############################################################### Run the User Specified Functions
+STACKS=( $(cat "$tempfile") )
+counter=0
+
+IFS=$'\n'
+stack_results=( $(for i in ${STACKS[*]} ; do echo "${i} N/A" ; done ) )
+unset IFS
+
+#stack_results=( "${#STACKS[*]/*/N\/A}" )
+#stack_results=( ${STACKS[@]/*/N\/A} )
+#unset IFS
+
+#[[ "$system" == "apple" ]] && open "https://${CSP_REGION}.console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active&tab=events&stackId=${stack_id}"
+
+function pre_capture() {
+	aws_manager capture-stack-outputs --aws-region us-east-1 --stack-name management-bitbrew-hub-iam-roles --yaml-file-path inventory/sandbox-us-east-1-hub.yaml 2> 1&> /dev/null
+	aws_manager capture-stack-outputs --aws-region us-west-2 --stack-name management-bitbrew-hub-iam-roles --yaml-file-path inventory/sandbox-us-west-2-hub.yaml 2> 1&> /dev/null
+	aws_manager capture-stack-outputs --aws-region eu-west-1 --stack-name management-bitbrew-hub-iam-roles --yaml-file-path inventory/sandbox-eu-west-1-hub.yaml 2> 1&> /dev/null
+	aws_manager capture-stack-outputs --stack-name global-bitbrew-hub-iam-roles --yaml-file-path inventory/common.yaml --aws-region ${CSP_REGION} 2> 1&> /dev/null
+	aws_manager capture-stack-outputs --stack-name global-bitbrew-hub-iam-policies --yaml-file-path inventory/common.yaml --aws-region ${CSP_REGION} 2> 1&> /dev/null
+	aws_manager capture-stack-outputs --aws-region ${CSP_REGION} --stack-name sandbox-bitbrew-hub-vpc-network --yaml-file-path inventory/${CSP_ENVIRONMENT}-${CSP_REGION}-hub.yaml 2> 1&> /dev/null
+	aws_manager capture-stack-outputs --aws-region ${CSP_REGION} --stack-name sandbox-bitbrew-hub-secgroups-root --yaml-file-path inventory/${CSP_ENVIRONMENT}-${CSP_REGION}-hub.yaml 2> 1&> /dev/null
+}
+
+pre_capture
+
+
+for STACK in ${STACKS[*]}; do 
+	reload='true'
+	CREATE=''
+	unset command
+	let counter=counter+1
+	progress=$(($counter * 100 / ${#STACKS[@]}))	
+	[ $progress -gt 99 ] && progress=99
+	${STACK}
+	unset stack_result
+	unset STACK_NAME
+        [[ "$autopilot" == "force" ]] && force='true' || force=''
+done
+
+show_url=$(echo "${stack_results[@]}" | grep -v 'N/A')
+[[ "$show_url" != "" ]] && message=$(echo -e "No Changes Made. \nView Details: https://${CSP_REGION}.console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active") || message=$(echo -e "Finished. \nView Details: https://console.aws.amazon.com/cloudformation/home?region=${CSP_REGION}#/stacks?filter=active")
+dialog --no-collapse --title "Stacks Modified" --mixedgauge "" 47 190 100 ${stack_results[*]} --and-widget --msgbox "$message" 8 170 

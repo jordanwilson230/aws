@@ -1,0 +1,11 @@
+---
+#Backup config
+backup:
+  hours: 
+    - 2
+  days: 
+    - 2
+  weeks: 
+    - 2
+  months: 
+    - 2
