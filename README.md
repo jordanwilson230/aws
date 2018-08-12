@@ -1,4 +1,15 @@
 # update_aws
+Screenshots:
+
+![Regions](https://user-images.githubusercontent.com/22456127/43998358-19670d96-9dc2-11e8-8b49-0d5c7d556a27.png)
+
+
+![Environments](https://user-images.githubusercontent.com/22456127/43998359-259d9e4a-9dc2-11e8-9d1d-173f07ea4fb0.png)
+
+
+![stacks](https://user-images.githubusercontent.com/22456127/43998363-4856d28a-9dc2-11e8-8d04-f8f4d2ed9811.png)
+
+
 The update_aws file provides a nice GUI command tool for working with AWS Cloudformation stacks.  It requires that aws_manager be installed (credit to Cake Solutions for the aws_manager). It is a WIP and ATM heavily tailored for my own personal use.  I will get around to generalizing it once I find the time. Lastly, yes...there are many other languages better suited for this sort of GUI, but hey..I like bash. :)
 
 # aws_manager
